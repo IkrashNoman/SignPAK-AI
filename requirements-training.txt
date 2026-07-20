@@ -1,0 +1,44 @@
+# Deep Learning (CUDA 12.8 compatible)
+
+torch==2.7.1
+torchvision==0.22.1
+torchaudio==2.7.1
+
+# Computer Vision
+
+opencv-python==5.0.0
+mediapipe==0.10.21
+
+# Scientific Computing
+
+numpy==2.5.1
+pandas==3.0.3
+scipy==1.18.0
+scikit-learn==1.9.0
+matplotlib==3.11.1
+seaborn==0.13.2
+
+# Image Processing
+
+Pillow==12.3.0
+
+# Progress Bars
+
+tqdm==4.69.0
+
+# Utilities
+
+PyYAML==6.0.3
+psutil==7.2.2
+
+# Model Metrics
+
+tensorboard==2.21.0
+
+# Data Augmentation
+
+albumentations==2.0.8
+
+# Model Summary
+
+torchinfo==1.8.0
