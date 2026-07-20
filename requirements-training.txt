@@ -5,7 +5,7 @@ torchaudio==2.7.1
 
 # Computer Vision
 opencv-python==5.0.0.93
-mediapipe>=0.10.14
+mediapipe==0.10.35
 
 # Scientific Computing
 numpy==2.5.1
