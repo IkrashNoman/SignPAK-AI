@@ -39,3 +39,5 @@ requests==2.32.3
 urllib3==2.3.0
 selenium==4.29.0
 webdriver-manager==4.0.2
+
+openhands

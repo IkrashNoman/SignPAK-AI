@@ -8,21 +8,14 @@ SIGNPAK-AI/
 ├── requirements-others.txt
 ├── config.py
 ├── main.py
-│
+├── check_gpu.py
+├── config.py
+├── check_environment.py
 │
 ├── scripts/
-│   ├── 01_download_dataset.py
-│   ├── 02_validate_dataset.py
-│   ├── 03_preprocess_videos.py
-│   ├── 04_extract_landmarks.py
-│   ├── 05_augment_dataset.py
-│   ├── 06_generate_metadata.py
-│   ├── 07_create_csv_splits.py
-│   └── 08_train_model.py
 |   │
-|   ├── check_gpu.py
-|   │
-|   ├── check_environment.py
+|   |
+|   |   
 │
 ├── src/
 │   ├── downloader.py
@@ -49,6 +42,13 @@ SIGNPAK-AI/
 │   │           ├── no.mp4
 │   │           └── ...
 │   │
+│   │
+│   ├── Signer_1/
+│   ├── Signer_2/
+│   ├── Signer_3/
+│   ├── Signer_4/
+│   ├── Signer_5/
+│   ├── raw/
 │   ├── repetitions/
 │   ├── cropped/
 │   ├── processed/
