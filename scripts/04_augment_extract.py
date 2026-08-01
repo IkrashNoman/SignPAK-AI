@@ -1,33 +1,47 @@
 """
-04_augment_extract.py — SignPAK-AI
-=======================================
-Multi-Core Parallelized Feature Extraction & Data Augmentation.
+04_augment_extract.py — SignPAK-AI (V1 Pipeline - 100% Silent Console)
+========================================================================
+Multi-Core Offline Extraction & Video Augmentation with C++ Stderr Redirection.
 
-For TRAIN and TEST videos:
-  - Generate 30 unique, compound augmentations per video in memory.
-  - Extract 225-dim MediaPipe landmark vectors (33 Pose + 21 Left + 21 Right).
-  - Save arrays to data/landmarks/ and append rows to CSV manifests.
+Features:
+  - 100% Silent Terminal: Redirects C++ fd2 (stderr) to NUL to block all W0000/INFO lines.
+  - Automatic Resume: Instant skip of pre-extracted .npy landmark files.
+  - Error Resilience: Catches corrupt/missing videos (e.g., yes.mp4) without crashing.
 
-For VAL videos:
-  - Extract landmarks from originals only (no augmentation).
-
-Place in:  scripts/04_augment_extract.py
-Run from:  SIGNPAK-AI root → python scripts/04_augment_extract.py
+Run from: SIGNPAK-AI root → python scripts/04_augment_extract.py
 """
 
-import re
+import os
+import sys
+
+# ── 1. C++ LOW-LEVEL STDERR REDIRECTION (BLOCKS ALL W0000 / INFO / TELEMETRY) ─
+os.environ["MEDIAPIPE_DISABLE_CLEARCUT"] = "1"
+os.environ["GLOG_minloglevel"] = "3"
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+os.environ["OPENCV_LOG_LEVEL"] = "OFF"
+
+def silence_cpp_stderr():
+    """Redirects C-level stderr (file descriptor 2) to NUL on Windows."""
+    try:
+        null_fd = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(null_fd, 2)
+        os.close(null_fd)
+    except Exception:
+        pass
+
+# Silence main process stderr
+silence_cpp_stderr()
+
 import csv
+import gc
 import json
 import random
 import urllib.request
-import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import numpy as np
 import cv2
 import mediapipe as mp
 from pathlib import Path
-from datetime import datetime
-from collections import defaultdict
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 
@@ -36,18 +50,20 @@ _THIS        = Path(__file__).resolve()
 PROJECT_ROOT = _THIS.parent.parent
 DATA_DIR     = PROJECT_ROOT / "data"
 CROPPED_DIR  = DATA_DIR / "cropped"
+PROCESSED_DIR = DATA_DIR / "processed"
+RAW_DIR      = DATA_DIR / "raw"
 LANDMARK_DIR = DATA_DIR / "landmarks"
 CSV_DIR      = DATA_DIR / "csv"
 LOG_DIR      = DATA_DIR / "logs"
 MODEL_DIR    = PROJECT_ROOT / "models"
 
+LOG_DIR.mkdir(parents=True, exist_ok=True)
 POSE_MODEL_PATH = MODEL_DIR / "pose_landmarker.task"
 HAND_MODEL_PATH = MODEL_DIR / "hand_landmarker.task"
 
 POSE_MODEL_URL = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_heavy/float16/latest/pose_landmarker_heavy.task"
 HAND_MODEL_URL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task"
 
-# ── Feature Dimensions ────────────────────────────────────────────────────────
 POSE_LM = 33
 HAND_LM = 21
 COORD   = 3
@@ -64,25 +80,41 @@ CSV_FIELDNAMES = [
 
 def ensure_models_exist():
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    LANDMARK_DIR.mkdir(parents=True, exist_ok=True)
     if not POSE_MODEL_PATH.exists():
-        print(f"📦 Downloading pose_landmarker model to {POSE_MODEL_PATH} ...")
+        print("📦 Downloading pose_landmarker model ...")
         urllib.request.urlretrieve(POSE_MODEL_URL, POSE_MODEL_PATH)
     if not HAND_MODEL_PATH.exists():
-        print(f"📦 Downloading hand_landmarker model to {HAND_MODEL_PATH} ...")
+        print("📦 Downloading hand_landmarker model ...")
         urllib.request.urlretrieve(HAND_MODEL_URL, HAND_MODEL_PATH)
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# Augmentation Functions
-# ═════════════════════════════════════════════════════════════════════════════
+def is_valid_landmark_file(file_path: Path) -> bool:
+    """Checks if a landmark file exists and is valid."""
+    if not file_path.exists() or file_path.stat().st_size < 1024:
+        return False
+    try:
+        arr = np.load(str(file_path))
+        if arr.ndim != 2 or arr.shape[1] != LM_DIM or arr.shape[0] < 4:
+            return False
+        if np.all(arr == 0):
+            return False
+        return True
+    except Exception:
+        if file_path.exists():
+            try: file_path.unlink()
+            except Exception: pass
+        return False
 
-def aug_speed(frames: list, factor: float) -> list:
+
+# ── Fast Video Augmentations ──────────────────────────────────────────────────
+def aug_speed(frames, factor):
     n = len(frames)
     new_n = max(4, int(n / factor))
     indices = np.linspace(0, n - 1, new_n).astype(int)
     return [frames[i] for i in indices]
 
-def aug_brightness(frames: list, delta: float) -> list:
+def aug_brightness(frames, delta):
     out = []
     for f in frames:
         hsv = cv2.cvtColor(f, cv2.COLOR_BGR2HSV).astype(np.float32)
@@ -90,7 +122,7 @@ def aug_brightness(frames: list, delta: float) -> list:
         out.append(cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR))
     return out
 
-def aug_contrast(frames: list, factor: float) -> list:
+def aug_contrast(frames, factor):
     out = []
     for f in frames:
         lab = cv2.cvtColor(f, cv2.COLOR_BGR2LAB).astype(np.float32)
@@ -99,197 +131,158 @@ def aug_contrast(frames: list, factor: float) -> list:
         out.append(cv2.cvtColor(lab.astype(np.uint8), cv2.COLOR_LAB2BGR))
     return out
 
-def aug_gaussian_noise(frames: list, sigma: float) -> list:
+def aug_gaussian_noise(frames, sigma):
     out = []
     for f in frames:
         noise = np.random.normal(0, sigma, f.shape).astype(np.float32)
         out.append(np.clip(f.astype(np.float32) + noise, 0, 255).astype(np.uint8))
     return out
 
-def aug_gaussian_blur(frames: list, ksize: int) -> list:
+def aug_gaussian_blur(frames, ksize):
     ksize = ksize if ksize % 2 == 1 else ksize + 1
     return [cv2.GaussianBlur(f, (ksize, ksize), 0) for f in frames]
 
-def aug_zoom(frames: list, factor: float) -> list:
+def aug_zoom(frames, factor):
     out = []
     h, w = frames[0].shape[:2]
     for f in frames:
         if factor > 1:
-            crop_h = int(h / factor)
-            crop_w = int(w / factor)
-            y0 = (h - crop_h) // 2
-            x0 = (w - crop_w) // 2
-            cropped = f[y0:y0 + crop_h, x0:x0 + crop_w]
-            out.append(cv2.resize(cropped, (w, h), interpolation=cv2.INTER_LINEAR))
+            crop_h, crop_w = int(h / factor), int(w / factor)
+            y0, x0 = (h - crop_h) // 2, (w - crop_w) // 2
+            out.append(cv2.resize(f[y0:y0 + crop_h, x0:x0 + crop_w], (w, h), interpolation=cv2.INTER_LINEAR))
         else:
-            pad_h = int(h * (1 - factor) / 2)
-            pad_w = int(w * (1 - factor) / 2)
+            pad_h, pad_w = int(h * (1 - factor) / 2), int(w * (1 - factor) / 2)
             padded = cv2.copyMakeBorder(f, pad_h, pad_h, pad_w, pad_w, cv2.BORDER_REPLICATE)
             out.append(cv2.resize(padded, (w, h), interpolation=cv2.INTER_LINEAR))
     return out
 
-def aug_rotation(frames: list, angle_deg: float) -> list:
+def aug_rotation(frames, angle_deg):
     h, w = frames[0].shape[:2]
     M = cv2.getRotationMatrix2D((w / 2, h / 2), angle_deg, 1.0)
     return [cv2.warpAffine(f, M, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE) for f in frames]
 
-def aug_translate(frames: list, tx_frac: float, ty_frac: float) -> list:
+def aug_translate(frames, tx_frac, ty_frac):
     h, w = frames[0].shape[:2]
-    tx = int(w * tx_frac)
-    ty = int(h * ty_frac)
-    M = np.float32([[1, 0, tx], [0, 1, ty]])
+    M = np.float32([[1, 0, int(w * tx_frac)], [0, 1, int(h * ty_frac)]])
     return [cv2.warpAffine(f, M, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE) for f in frames]
 
-def aug_drop_frames(frames: list, n_drop: int) -> list:
-    if len(frames) <= n_drop + 4:
-        return frames
+def aug_drop_frames(frames, n_drop):
+    if len(frames) <= n_drop + 4: return frames
     keep = sorted(random.sample(range(len(frames)), len(frames) - n_drop))
     return [frames[i] for i in keep]
 
-def aug_duplicate_frames(frames: list, n_dup: int) -> list:
-    result = list(frames)
+def aug_duplicate_frames(frames, n_dup):
+    res = list(frames)
     for _ in range(n_dup):
-        idx = random.randint(0, len(result) - 1)
-        result.insert(idx, result[idx])
-    return result
-
-def aug_salt_pepper(frames: list, prob: float = 0.02) -> list:
-    out = []
-    for f in frames:
-        noisy = f.copy()
-        mask  = np.random.random(f.shape[:2])
-        noisy[mask < prob / 2]       = 0
-        noisy[mask > 1 - prob / 2]   = 255
-        out.append(noisy)
-    return out
-
+        idx = random.randint(0, len(res) - 1)
+        res.insert(idx, res[idx])
+    return res
 
 AUG_POOL = [
-    ("speed_0.60",   aug_speed,           {"factor": 0.60}),
-    ("speed_0.75",   aug_speed,           {"factor": 0.75}),
-    ("speed_0.85",   aug_speed,           {"factor": 0.85}),
-    ("speed_1.15",   aug_speed,           {"factor": 1.15}),
-    ("speed_1.25",   aug_speed,           {"factor": 1.25}),
-    ("speed_1.40",   aug_speed,           {"factor": 1.40}),
-    ("bright+0.20", aug_brightness,      {"delta":  0.20}),
-    ("bright+0.40", aug_brightness,      {"delta":  0.40}),
-    ("bright-0.20", aug_brightness,      {"delta": -0.20}),
-    ("bright-0.40", aug_brightness,      {"delta": -0.40}),
-    ("contrast+0.20", aug_contrast,      {"factor": 1.20}),
-    ("contrast+0.40", aug_contrast,      {"factor": 1.40}),
-    ("contrast-0.20", aug_contrast,      {"factor": 0.80}),
-    ("contrast-0.40", aug_contrast,      {"factor": 0.60}),
-    ("noise_light",   aug_gaussian_noise, {"sigma": 8}),
-    ("noise_medium",  aug_gaussian_noise, {"sigma": 18}),
-    ("blur_slight",   aug_gaussian_blur,  {"ksize": 3}),
-    ("blur_motion",   aug_gaussian_blur,  {"ksize": 5}),
-    ("zoom_0.90",   aug_zoom,            {"factor": 0.90}),
-    ("zoom_1.10",   aug_zoom,            {"factor": 1.10}),
-    ("zoom_1.20",   aug_zoom,            {"factor": 1.20}),
-    ("rot_-10",     aug_rotation,        {"angle_deg": -10}),
-    ("rot_-5",      aug_rotation,        {"angle_deg": -5}),
-    ("rot_+5",      aug_rotation,        {"angle_deg":  5}),
-    ("rot_+10",     aug_rotation,        {"angle_deg":  10}),
-    ("trans_left",  aug_translate,       {"tx_frac": -0.05, "ty_frac": 0.0}),
-    ("trans_right", aug_translate,       {"tx_frac":  0.05, "ty_frac": 0.0}),
-    ("trans_up",    aug_translate,       {"tx_frac":  0.0,  "ty_frac": -0.05}),
-    ("trans_down",  aug_translate,       {"tx_frac":  0.0,  "ty_frac":  0.05}),
-    ("drop_2",      aug_drop_frames,     {"n_drop": 2}),
-    ("drop_3",      aug_drop_frames,     {"n_drop": 3}),
-    ("dup_2",       aug_duplicate_frames, {"n_dup": 2}),
-    ("dup_3",       aug_duplicate_frames, {"n_dup": 3}),
-    ("salt_pepper", aug_salt_pepper,     {"prob": 0.02}),
+    ("speed_0.60", aug_speed, {"factor": 0.60}), ("speed_0.75", aug_speed, {"factor": 0.75}),
+    ("speed_1.25", aug_speed, {"factor": 1.25}), ("bright+0.20", aug_brightness, {"delta": 0.20}),
+    ("bright-0.20", aug_brightness, {"delta": -0.20}), ("contrast+0.20", aug_contrast, {"factor": 1.20}),
+    ("noise_light", aug_gaussian_noise, {"sigma": 8}), ("blur_slight", aug_gaussian_blur, {"ksize": 3}),
+    ("zoom_1.10", aug_zoom, {"factor": 1.10}), ("rot_-5", aug_rotation, {"angle_deg": -5}),
+    ("rot_+5", aug_rotation, {"angle_deg": 5}), ("trans_left", aug_translate, {"tx_frac": -0.05, "ty_frac": 0.0}),
+    ("trans_right", aug_translate, {"tx_frac": 0.05, "ty_frac": 0.0}), ("drop_2", aug_drop_frames, {"n_drop": 2}),
+    ("dup_2", aug_duplicate_frames, {"n_dup": 2}),
 ]
 
-AUG_NAMES = [a[0] for a in AUG_POOL]
-
-def generate_aug_sets(n: int = N_AUGMENTS, seed: int = RANDOM_SEED) -> list[list[int]]:
+def generate_aug_sets(n=N_AUGMENTS, seed=RANDOM_SEED):
     rng = random.Random(seed)
-    used_sets: set[frozenset] = set()
-    result = []
-    attempts = 0
-
-    while len(result) < n and attempts < 5000:
-        attempts += 1
-        k = rng.choice([2, 3, 4, 5])
+    used, res = set(), []
+    while len(res) < n:
+        k = rng.choice([2, 3, 4])
         chosen = rng.sample(range(len(AUG_POOL)), k)
         fs = frozenset(chosen)
-        if fs not in used_sets:
-            used_sets.add(fs)
-            result.append(chosen)
-
-    if len(result) < n:
-        raise RuntimeError(f"Could not generate {n} unique augmentation sets.")
-    return result
-
-def apply_aug_set(frames: list, aug_indices: list[int]) -> list:
-    result = frames
-    for idx in aug_indices:
-        _, fn, kwargs = AUG_POOL[idx]
-        result = fn(result, **kwargs)
-    return result
+        if fs not in used:
+            used.add(fs)
+            res.append(chosen)
+    return res
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# MediaPipe Extraction Worker (Runs inside independent process)
-# ═════════════════════════════════════════════════════════════════════════════
+def resolve_video_path(file_path_str: str) -> Path | None:
+    p = PROJECT_ROOT / file_path_str
+    if p.exists() and p.stat().st_size > 1024: return p
 
-def process_single_video_worker(row: dict, augment: bool) -> tuple[list[dict], list[dict]]:
-    """Worker function for ProcessPoolExecutor"""
-    raw_path = PROJECT_ROOT / row["file_path"]
-    rel_in_data = (PROJECT_ROOT / row["file_path"]).relative_to(DATA_DIR)
-    cropped_path = CROPPED_DIR / rel_in_data
-    video_path   = cropped_path if cropped_path.exists() else raw_path
+    rel_data = p.relative_to(DATA_DIR) if DATA_DIR in p.parents else Path(file_path_str)
+    for base in [CROPPED_DIR, PROCESSED_DIR, RAW_DIR]:
+        candidate = base / rel_data
+        if candidate.exists() and candidate.stat().st_size > 1024:
+            return candidate
+        candidate_flat = base / p.name
+        if candidate_flat.exists() and candidate_flat.stat().st_size > 1024:
+            return candidate_flat
+    return None
 
-    if not video_path.exists():
-        row["landmark_path"] = ""
-        return [row], []
 
+def process_single_video_worker(row: dict, augment: bool) -> tuple[list[dict], str | None]:
+    # Silence C++ stderr inside worker process
+    silence_cpp_stderr()
+
+    video_path = resolve_video_path(row["file_path"])
     label     = row["label"]
     signer_id = row["signer_id"]
+    identifier = f"{signer_id}/{label}"
+
+    if not video_path or not video_path.exists():
+        return [], f"❌ MISSING/CORRUPT VIDEO: {identifier} ({row['file_path']})"
 
     lm_base = (LANDMARK_DIR / signer_id / label)
     lm_base.mkdir(parents=True, exist_ok=True)
     orig_lm_path = lm_base / "original.npy"
 
-    cap = cv2.VideoCapture(str(video_path))
-    frames = []
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        frames.append(frame)
-    cap.release()
+    all_exist = is_valid_landmark_file(orig_lm_path)
+    if augment and all_exist:
+        for aug_idx in range(N_AUGMENTS):
+            if not is_valid_landmark_file(lm_base / f"aug_{aug_idx:03d}.npy"):
+                all_exist = False
+                break
 
-    if not frames:
-        row["landmark_path"] = ""
-        return [row], []
+    if all_exist:
+        out_rows = []
+        row_orig = dict(row)
+        row_orig["landmark_path"] = str(orig_lm_path.relative_to(PROJECT_ROOT))
+        row_orig["augmented"]     = False
+        row_orig["aug_id"]        = ""
+        out_rows.append(row_orig)
 
-    # Initialize task engines per process
-    base_pose_opts = python.BaseOptions(
-        model_asset_path=str(POSE_MODEL_PATH),
-        delegate=python.BaseOptions.Delegate.CPU
-    )
-    pose_opts = vision.PoseLandmarkerOptions(
-        base_options=base_pose_opts,
-        running_mode=vision.RunningMode.IMAGE,
-        min_pose_detection_confidence=0.5
-    )
+        if augment:
+            for aug_idx in range(N_AUGMENTS):
+                aug_id = f"aug_{aug_idx:03d}"
+                aug_row = dict(row)
+                aug_row["landmark_path"] = str((lm_base / f"{aug_id}.npy").relative_to(PROJECT_ROOT))
+                aug_row["augmented"]     = True
+                aug_row["aug_id"]        = aug_id
+                out_rows.append(aug_row)
+        return out_rows, None
+
+    try:
+        cap = cv2.VideoCapture(str(video_path))
+        frames = []
+        while True:
+            ret, frame = cap.read()
+            if not ret or frame is None: break
+            if frame.shape[0] != 256 or frame.shape[1] != 256:
+                frame = cv2.resize(frame, (256, 256), interpolation=cv2.INTER_AREA)
+            frames.append(frame)
+        cap.release()
+    except Exception as e:
+        return [], f"❌ OPENCV ERROR reading {identifier}: {e}"
+
+    if not frames or len(frames) < 4:
+        return [], f"⚠️ SKIPPED (Too few frames/corrupt): {identifier}"
+
+    base_pose_opts = python.BaseOptions(model_asset_path=str(POSE_MODEL_PATH), delegate=python.BaseOptions.Delegate.CPU)
+    pose_opts = vision.PoseLandmarkerOptions(base_options=base_pose_opts, running_mode=vision.RunningMode.IMAGE, min_pose_detection_confidence=0.5)
     pose_landmarker = vision.PoseLandmarker.create_from_options(pose_opts)
 
-    base_hand_opts = python.BaseOptions(
-        model_asset_path=str(HAND_MODEL_PATH),
-        delegate=python.BaseOptions.Delegate.CPU
-    )
-    hand_opts = vision.HandLandmarkerOptions(
-        base_options=base_hand_opts,
-        running_mode=vision.RunningMode.IMAGE,
-        num_hands=2,
-        min_hand_detection_confidence=0.4
-    )
+    base_hand_opts = python.BaseOptions(model_asset_path=str(HAND_MODEL_PATH), delegate=python.BaseOptions.Delegate.CPU)
+    hand_opts = vision.HandLandmarkerOptions(base_options=base_hand_opts, running_mode=vision.RunningMode.IMAGE, num_hands=2, min_hand_detection_confidence=0.4)
     hand_landmarker = vision.HandLandmarker.create_from_options(hand_opts)
 
-    def extract_landmarks(frame_seq: list) -> np.ndarray:
+    def extract_landmarks(frame_seq):
         rows = []
         for frame in frame_seq:
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -308,7 +301,6 @@ def process_single_video_worker(row: dict, augment: bool) -> tuple[list[dict], l
                     offset = 99 if lbl == "left" else 162
                     for idx, lm in enumerate(hand_lms[:HAND_LM]):
                         row_vec[offset + idx * 3 : offset + idx * 3 + 3] = [lm.x, lm.y, lm.z]
-
             rows.append(row_vec)
 
         arr = np.stack(rows)
@@ -319,33 +311,36 @@ def process_single_video_worker(row: dict, augment: bool) -> tuple[list[dict], l
                 arr[:, col] = np.interp(indices, indices[~zero_mask], arr[~zero_mask, col])
         return arr
 
-    # Extract original
-    orig_lm = extract_landmarks(frames)
-    np.save(str(orig_lm_path), orig_lm)
+    out_rows = []
 
-    row["landmark_path"] = str(orig_lm_path.relative_to(PROJECT_ROOT))
-    row["augmented"]     = False
-    row["aug_id"]        = ""
-    
-    out_rows = [row]
-    meta_rows = []
+    if not is_valid_landmark_file(orig_lm_path):
+        orig_lm = extract_landmarks(frames)
+        np.save(str(orig_lm_path), orig_lm)
+
+    row_orig = dict(row)
+    row_orig["landmark_path"] = str(orig_lm_path.relative_to(PROJECT_ROOT))
+    row_orig["augmented"]     = False
+    row_orig["aug_id"]        = ""
+    out_rows.append(row_orig)
 
     if augment:
         vid_seed = RANDOM_SEED + abs(hash(row["file_path"])) % 100000
         aug_sets = generate_aug_sets(n=N_AUGMENTS, seed=vid_seed)
 
         for aug_idx, aug_combo in enumerate(aug_sets):
-            aug_names = [AUG_NAMES[i] for i in aug_combo]
-            aug_id    = f"aug_{aug_idx:03d}"
-
-            try:
-                aug_frames = apply_aug_set(frames, aug_combo)
-                aug_lm     = extract_landmarks(aug_frames)
-            except Exception:
-                continue
-
+            aug_id = f"aug_{aug_idx:03d}"
             aug_lm_path = lm_base / f"{aug_id}.npy"
-            np.save(str(aug_lm_path), aug_lm)
+
+            if not is_valid_landmark_file(aug_lm_path):
+                try:
+                    aug_frames = frames
+                    for idx in aug_combo:
+                        _, fn, kwargs = AUG_POOL[idx]
+                        aug_frames = fn(aug_frames, **kwargs)
+                    aug_lm = extract_landmarks(aug_frames)
+                    np.save(str(aug_lm_path), aug_lm)
+                except Exception:
+                    continue
 
             aug_row = dict(row)
             aug_row["landmark_path"] = str(aug_lm_path.relative_to(PROJECT_ROOT))
@@ -353,79 +348,70 @@ def process_single_video_worker(row: dict, augment: bool) -> tuple[list[dict], l
             aug_row["aug_id"]        = aug_id
             out_rows.append(aug_row)
 
-            meta_rows.append({
-                "signer_id":     signer_id,
-                "label":         label,
-                "aug_id":        aug_id,
-                "aug_combo":     "+".join(aug_names),
-                "landmark_path": str(aug_lm_path.relative_to(PROJECT_ROOT)),
-                "shape":         str(aug_lm.shape),
-            })
-
     pose_landmarker.close()
     hand_landmarker.close()
+    del frames
+    gc.collect()
+    return out_rows, None
 
-    return out_rows, meta_rows
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# Main Split Coordinator
-# ═════════════════════════════════════════════════════════════════════════════
 
 def process_split_parallel(split: str, augment: bool) -> None:
     csv_path = CSV_DIR / f"{split}.csv"
-    if not csv_path.exists():
-        print(f"  ⚠️  {csv_path} not found — skipping split.")
-        return
+    if not csv_path.exists(): return
 
     with open(csv_path, newline="", encoding="utf-8") as f:
-        rows = list(csv.DictReader(f))
+        rows = [r for r in csv.DictReader(f) if r.get("augmented", "").lower() != "true"]
 
-    print(f"\n{'='*60}")
-    print(f"  Processing Split: {split.upper()} (Parallel Execution)")
-    print(f"{'='*60}")
+    print(f"\n{'='*65}")
+    print(f" 🚀 Processing Split: {split.upper()} ({len(rows)} Target Videos)")
+    print(f"{'='*65}")
 
-    num_workers = max(1, os.cpu_count() - 2)
-    print(f"🚀 Spawning {num_workers} parallel CPU process workers ...")
-
-    all_new_rows = []
-    all_meta_rows = []
+    num_workers = min(4, max(1, os.cpu_count() - 2))
+    final_rows = []
+    error_logs = []
+    total = len(rows)
 
     with ProcessPoolExecutor(max_workers=num_workers) as executor:
         futures = {executor.submit(process_single_video_worker, row, augment): row for row in rows}
         
-        for future in as_completed(futures):
+        for idx, future in enumerate(as_completed(futures), 1):
             row_ref = futures[future]
             try:
-                out_rows, meta_rows = future.result()
-                all_new_rows.extend(out_rows)
-                all_meta_rows.extend(meta_rows)
-                print(f"  ✅ Finished: {row_ref['signer_id']}/{row_ref['label']} (+{len(out_rows)-1} augments)")
+                res_rows, err_msg = future.result()
+                if err_msg:
+                    print(f"  [{idx:03d}/{total:03d}] {err_msg}")
+                    error_logs.append(err_msg)
+                if res_rows:
+                    final_rows.extend(res_rows)
+                    if not err_msg:
+                        print(f"  [{idx:03d}/{total:03d}] ✅ {res_rows[0]['signer_id']}/{res_rows[0]['label']} (+{len(res_rows)-1} augments)")
             except Exception as exc:
-                print(f"  ❌ Error processing {row_ref['signer_id']}/{row_ref['label']}: {exc}")
+                err = f"❌ WORKER EXCEPTION: {row_ref['signer_id']}/{row_ref['label']} -> {exc}"
+                print(f"  [{idx:03d}/{total:03d}] {err}")
+                error_logs.append(err)
 
-    # Write CSV
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=CSV_FIELDNAMES)
         w.writeheader()
-        w.writerows(all_new_rows)
+        w.writerows(final_rows)
 
-    print(f"  ✅ Updated {split}.csv ({len(all_new_rows)} rows total)")
+    if error_logs:
+        error_log_file = LOG_DIR / f"04_missing_videos_{split}.txt"
+        with open(error_log_file, "w", encoding="utf-8") as f:
+            f.write("\n".join(error_logs))
+
+    print(f"  ✅ Saved {split}.csv ({len(final_rows)} total landmark entries)")
 
 
-def main() -> None:
+def main():
     ensure_models_exist()
-    print(f"\nProject Root : {PROJECT_ROOT}")
-    print(f"Landmark Dir : {LANDMARK_DIR}\n")
-
+    print("\n" + "═"*65)
+    print(" 🎯 SignPAK-AI High-Speed Landmark Extraction Engine")
+    print("═"*65)
     process_split_parallel("train", augment=True)
+    process_split_parallel("val",   augment=True)
     process_split_parallel("test",  augment=True)
-    process_split_parallel("val",   augment=False)
-
-    print("\n✅ All landmark extractions complete. Outputs saved to data/landmarks/\n")
-
+    print("\n✅ All Landmark Extractions & Augmentations Complete!\n")
 
 if __name__ == "__main__":
-    random.seed(RANDOM_SEED)
-    np.random.seed(RANDOM_SEED)
     main()

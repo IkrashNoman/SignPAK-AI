@@ -1,12 +1,13 @@
 """
-05_train_scratch.py — SignPAK-AI (Maximized 80/20 K-Fold Pipeline)
-====================================================================
-Data Optimization:
-  - Eliminates redundant 3-way splits to maximize training samples.
-  - 5-Fold GroupKFold: 80% Train (~5 videos/class) | 20% Val (1 video/class).
-  - Evaluates out-of-sample zero-shot signers across all 5 folds.
+05_transfer_learning.py — SignPAK-AI (Pose-TGCN Transfer Engine)
+==================================================================
+Transfer Learning Strategy:
+  - Exact tensor matching against 'models/tgcn_wlasl_pretrained.pth'.
+  - Channel-wise Normalization (handles arbitrary sequence length T=60 smoothly).
+  - Freezes spatial GCN backbone layers (preserves WLASL human pose representations).
+  - Evaluates on 5-Fold GroupKFold (Zero-Shot Cross-Signer Validation).
 
-Run from: SIGNPAK-AI root → python scripts/05_train_scratch.py
+Run from: SIGNPAK-AI root → python scripts/05_transfer_learning.py
 """
 
 import os
@@ -25,18 +26,168 @@ _THIS        = Path(__file__).resolve()
 PROJECT_ROOT = _THIS.parent.parent
 DATA_DIR     = PROJECT_ROOT / "data"
 CSV_V2_DIR   = DATA_DIR / "csv" / "v2"
-CKPT_DIR     = PROJECT_ROOT / "models" / "checkpoints_opt"
+CKPT_DIR     = PROJECT_ROOT / "models" / "checkpoints_transfer"
 CKPT_DIR.mkdir(parents=True, exist_ok=True)
+WEIGHTS_PATH = PROJECT_ROOT / "models" / "tgcn_wlasl_pretrained.pth"
 
-MAX_SEQ_LEN     = 60
-FEATURE_DIM     = 726      # 225 Pos + 225 Vel + 225 Accel + 21 Angles + 30 Distances
-BATCH_SIZE      = 16
-EPOCHS          = 60
-N_SPLITS        = 5
-LEARNING_RATE   = 8e-4
-EPOCH_SAMPLES   = 800      # Fast balanced RAM resamples per epoch
+MAX_SEQ_LEN   = 60
+FEATURE_DIM   = 726
+BATCH_SIZE    = 16
+EPOCHS        = 50
+N_SPLITS      = 5
+LEARNING_RATE = 3e-4
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 1. Pose-TGCN Architecture with Flexible Channel Norm
+# ═════════════════════════════════════════════════════════════════════════════
+
+class GraphConvolutionLayer(nn.Module):
+    """Matches 'gc1' and 'gcbs' blocks in TGCN checkpoint."""
+    def __init__(self, in_features: int, out_features: int, num_nodes: int = 55):
+        super().__init__()
+        self.weight = nn.Parameter(torch.FloatTensor(in_features, out_features))
+        self.att = nn.Parameter(torch.FloatTensor(num_nodes, num_nodes))
+        self.bias = nn.Parameter(torch.FloatTensor(out_features))
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.kaiming_uniform_(self.weight)
+        nn.init.uniform_(self.att, a=-0.05, b=0.05)
+        nn.init.zeros_(self.bias)
+
+    def forward(self, x):
+        # x: (B, T, Nodes, In_Features)
+        out = torch.matmul(self.att, x)
+        out = torch.matmul(out, self.weight) + self.bias
+        return out
+
+
+class GCBBlock(nn.Module):
+    """Graph Convolutional Block with Channel-Wise Normalization."""
+    def __init__(self, in_channels: int = 256, out_channels: int = 256):
+        super().__init__()
+        self.gc1 = GraphConvolutionLayer(in_channels, out_channels)
+        self.bn1 = nn.BatchNorm1d(out_channels)
+
+    def forward(self, x):
+        out = self.gc1(x)  # (B, T, V, C)
+        B, T, V, C = out.shape
+        out_flat = out.view(B * T * V, C)
+        out_bn = self.bn1(out_flat).view(B, T, V, C)
+        return torch.relu(out_bn)
+
+
+class PoseTGCNTransferModel(nn.Module):
+    """Full Transfer Model with Flexible Channel-Wise Batch Normalization."""
+    def __init__(self, in_features: int = FEATURE_DIM, num_classes: int = 37):
+        super().__init__()
+        # Adaptation Layer: Project 726 features -> 55 nodes * 100 dims
+        self.stem_adaptor = nn.Sequential(
+            nn.Linear(in_features, 55 * 100),
+            nn.ReLU()
+        )
+
+        # Pretrained TGCN Backbone
+        self.gc1 = GraphConvolutionLayer(100, 256)
+        self.bn1 = nn.BatchNorm1d(256)
+        
+        # Stacked Graph Blocks (gcbs)
+        self.gcbs = nn.ModuleList([GCBBlock(256, 256) for _ in range(4)])
+
+        # Fine-Tuning Sequence Classifier Head
+        self.lstm = nn.LSTM(
+            input_size=256, hidden_size=256, num_layers=2,
+            batch_first=True, bidirectional=True, dropout=0.4
+        )
+        
+        self.attn = nn.Sequential(
+            nn.Linear(512, 128),
+            nn.Tanh(),
+            nn.Linear(128, 1)
+        )
+        
+        self.classifier = nn.Sequential(
+            nn.Dropout(0.5),
+            nn.Linear(512, 256),
+            nn.BatchNorm1d(256),
+            nn.ReLU(),
+            nn.Dropout(0.4),
+            nn.Linear(256, num_classes)
+        )
+
+    def load_pretrained_weights(self, weights_path: Path):
+        """Loads and maps exact tensor shapes from checkpoint."""
+        if not weights_path.exists():
+            print(f"⚠️ Pretrained file not found at {weights_path}.")
+            return False
+
+        try:
+            checkpoint = torch.load(weights_path, map_location="cpu")
+            if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
+                ckpt_dict = checkpoint["state_dict"]
+            elif isinstance(checkpoint, dict):
+                ckpt_dict = checkpoint
+            else:
+                ckpt_dict = getattr(checkpoint, "state_dict", lambda: {})()
+
+            model_dict = self.state_dict()
+            transferred_dict = {}
+
+            for k, v in ckpt_dict.items():
+                if k in model_dict and model_dict[k].shape == v.shape:
+                    transferred_dict[k] = v
+
+            model_dict.update(transferred_dict)
+            self.load_state_dict(model_dict)
+            print(f"✅ Successfully transferred {len(transferred_dict)} / {len(ckpt_dict)} pretrained weight tensors!")
+            return True
+        except Exception as e:
+            print(f"⚠️ Error loading weights: {e}")
+            return False
+
+    def freeze_pretrained_backbone(self):
+        """Freezes spatial graph parameters."""
+        for param in self.gc1.parameters():
+            param.requires_grad = False
+        for param in self.bn1.parameters():
+            param.requires_grad = False
+        for block in self.gcbs:
+            for param in block.parameters():
+                param.requires_grad = False
+        print("🔒 Pose-TGCN Graph Backbone layers FROZEN for Transfer Learning.")
+
+    def forward(self, x):
+        B, T, _ = x.shape
+        x_proj = self.stem_adaptor(x).view(B, T, 55, 100)  # (B, T, 55, 100)
+
+        # TGCN Forward Pass
+        g1 = self.gc1(x_proj)  # (B, T, 55, 256)
+        
+        # Channel-wise Normalization across (B * T * V, C)
+        g1_flat = g1.view(B * T * 55, 256)
+        g1_bn = torch.relu(self.bn1(g1_flat)).view(B, T, 55, 256)
+
+        out_g = g1_bn
+        for block in self.gcbs:
+            out_g = block(out_g)  # (B, T, 55, 256)
+
+        # Node Pool across 55 joints -> Temporal sequence (B, T, 256)
+        seq_feat = out_g.mean(dim=2)
+
+        # BiLSTM + Attention
+        out_lstm, _ = self.lstm(seq_feat)  # (B, T, 512)
+        weights = torch.softmax(self.attn(out_lstm), dim=1)
+        context = torch.sum(out_lstm * weights, dim=1)  # (B, 512)
+
+        logits = self.classifier(context)
+        return logits
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 2. Feature Extraction Engine
+# ═════════════════════════════════════════════════════════════════════════════
 
 ANGLE_TRIPLETS = [
     (11, 13, 15), (12, 14, 16), (13, 15, 33), (14, 16, 54),
@@ -52,11 +203,7 @@ DIST_PAIRS = [
 ]
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# Vectorized Feature Processor
-# ═════════════════════════════════════════════════════════════════════════════
-
-def compute_features_vectorized(raw_arr: np.ndarray, augment: bool = False) -> np.ndarray:
+def extract_features_vectorized(raw_arr: np.ndarray, augment: bool = False) -> np.ndarray:
     T = raw_arr.shape[0]
     coords = raw_arr.reshape(T, 75, 3).copy()
 
@@ -65,7 +212,7 @@ def compute_features_vectorized(raw_arr: np.ndarray, augment: bool = False) -> n
         z_noise  = np.random.normal(0, 0.03, size=(T, 75, 1))
         coords += np.concatenate([xy_noise, z_noise], axis=-1)
 
-        scale = np.random.uniform(0.88, 1.12)
+        scale = np.random.uniform(0.9, 1.1)
         coords *= scale
 
         angle = np.radians(np.random.uniform(-10, 10))
@@ -126,12 +273,8 @@ def compute_features_vectorized(raw_arr: np.ndarray, augment: bool = False) -> n
     return np.concatenate([normalized_pos, velocity, accel, angles, distances], axis=-1).astype(np.float32)
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# Fast PyTorch Dataset
-# ═════════════════════════════════════════════════════════════════════════════
-
-class FastSignDataset(Dataset):
-    def __init__(self, samples: list, epoch_samples: int = EPOCH_SAMPLES, max_len: int = MAX_SEQ_LEN, augment: bool = False):
+class TransferDataset(Dataset):
+    def __init__(self, samples: list, epoch_samples: int = 800, max_len: int = MAX_SEQ_LEN, augment: bool = False):
         self.base_samples = samples
         self.epoch_samples = epoch_samples if augment else len(samples)
         self.max_len = max_len
@@ -149,87 +292,26 @@ class FastSignDataset(Dataset):
             indices = np.linspace(0, t - 1, self.max_len).astype(int)
             raw_data = raw_data[indices]
 
-        processed_data = compute_features_vectorized(raw_data, augment=self.augment)
+        processed_data = extract_features_vectorized(raw_data, augment=self.augment)
         return torch.from_numpy(processed_data), torch.tensor(item["label"], dtype=torch.long)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# BiLSTM Classifier Architecture
+# 3. Execution Pipeline
 # ═════════════════════════════════════════════════════════════════════════════
 
-class TemporalAttention(nn.Module):
-    def __init__(self, hidden_dim: int):
-        super().__init__()
-        self.attn = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.Tanh(),
-            nn.Linear(hidden_dim // 2, 1)
-        )
-
-    def forward(self, x):
-        weights = torch.softmax(self.attn(x), dim=1)
-        return torch.sum(x * weights, dim=1)
-
-
-class SignPAKClassifierOpt(nn.Module):
-    def __init__(self, feature_dim: int = FEATURE_DIM, num_classes: int = 37):
-        super().__init__()
-        self.stem = nn.Sequential(
-            nn.Linear(feature_dim, 256),
-            nn.BatchNorm1d(MAX_SEQ_LEN),
-            nn.ReLU(),
-            nn.Dropout(0.4)
-        )
-
-        self.conv1 = nn.Conv1d(256, 256, kernel_size=3, padding=1)
-        self.bn1   = nn.BatchNorm1d(256)
-        self.relu  = nn.ReLU()
-        self.drop1 = nn.Dropout(0.4)
-
-        self.lstm = nn.LSTM(
-            input_size=256, hidden_size=128, num_layers=2,
-            batch_first=True, bidirectional=True, dropout=0.4
-        )
-
-        self.attn = TemporalAttention(256)
-        self.classifier = nn.Sequential(
-            nn.Dropout(0.5),
-            nn.Linear(256, 128),
-            nn.ReLU(),
-            nn.Dropout(0.4),
-            nn.Linear(128, num_classes)
-        )
-
-    def forward(self, x):
-        x = self.stem(x)                 # (B, T, 256)
-        x = x.transpose(1, 2)            # (B, 256, T)
-        x = self.drop1(self.relu(self.bn1(self.conv1(x))))
-        x = x.transpose(1, 2)            # (B, T, 256)
-
-        out, _ = self.lstm(x)            # (B, T, 256)
-        context = self.attn(out)         # (B, 256)
-        logits = self.classifier(context)
-        return logits
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# 80/20 Cross-Validation Execution Engine
-# ═════════════════════════════════════════════════════════════════════════════
-
-def run_training():
-    print(f"🚀 Execution Engine Device: {DEVICE} ({torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'})")
+def run_transfer_learning():
+    print(f"🚀 Pretrained TGCN Transfer Engine Device: {DEVICE} ({torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'})")
 
     all_samples = []
     all_label_strs = set()
 
-    # Collect ALL original videos across train/val/test manifests into ONE unified pool
     for split in ["train", "val", "test"]:
         csv_path = CSV_V2_DIR / f"{split}.csv"
         if csv_path.exists():
             with open(csv_path, "r", encoding="utf-8") as f:
                 for row in csv.DictReader(f):
                     if row.get("augmented", "").lower() == "true": continue
-
                     lm_path = row.get("landmark_path", "")
                     if lm_path and (PROJECT_ROOT / lm_path).exists():
                         all_samples.append({
@@ -253,7 +335,7 @@ def run_training():
     groups = np.array([s["signer_id"] for s in all_samples])
 
     unique_groups = sorted(set(groups))
-    print(f"Unified Dataset: {len(all_samples)} Clean Videos Pooled | Signers: {unique_groups} | Classes: {num_classes}\n")
+    print(f"Dataset Loaded: {len(all_samples)} Clean Videos | Signers: {unique_groups} | Classes: {num_classes}\n")
 
     n_folds = min(N_SPLITS, len(unique_groups))
     gkf = GroupKFold(n_splits=n_folds)
@@ -261,32 +343,37 @@ def run_training():
     num_workers = 2 if os.name == "nt" else 4
 
     for fold, (train_idx, val_idx) in enumerate(gkf.split(X, y, groups), 1):
-        print(f"\n{'='*60}\n 🔄 RUNNING 80/20 FOLD {fold}/{n_folds} (GroupKFold)\n{'='*60}")
+        print(f"\n{'='*60}\n 🔄 RUNNING PRETRAINED TGCN TRANSFER FOLD {fold}/{n_folds}\n{'='*60}")
 
         train_samples = X[train_idx].tolist()
         val_samples   = X[val_idx].tolist()
-
-        val_signers = sorted(set(s["signer_id"] for s in val_samples))
-        print(f"Train Size: {len(train_samples)} videos | Val Size: {len(val_samples)} videos (Signer: {val_signers})")
+        val_signers   = sorted(set(s["signer_id"] for s in val_samples))
+        print(f"Validation Signer(s) for Fold {fold}: {val_signers}")
 
         train_loader = DataLoader(
-            FastSignDataset(train_samples, epoch_samples=EPOCH_SAMPLES, augment=True),
+            TransferDataset(train_samples, epoch_samples=800, augment=True),
             batch_size=BATCH_SIZE, shuffle=True, num_workers=num_workers, pin_memory=True
         )
         val_loader = DataLoader(
-            FastSignDataset(val_samples, augment=False),
+            TransferDataset(val_samples, augment=False),
             batch_size=BATCH_SIZE, shuffle=False, num_workers=num_workers, pin_memory=True
         )
 
-        model = SignPAKClassifierOpt(feature_dim=FEATURE_DIM, num_classes=num_classes).to(DEVICE)
-        criterion = nn.CrossEntropyLoss(label_smoothing=0.12)
-        optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-2)
+        model = PoseTGCNTransferModel(in_features=FEATURE_DIM, num_classes=num_classes).to(DEVICE)
+        
+        # Load Pretrained Weights & Freeze Spatial Base
+        loaded = model.load_pretrained_weights(WEIGHTS_PATH)
+        if loaded:
+            model.freeze_pretrained_backbone()
+
+        criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+        optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=LEARNING_RATE, weight_decay=1e-2)
         
         total_steps = EPOCHS * len(train_loader)
         scheduler = optim.lr_scheduler.OneCycleLR(optimizer, max_lr=LEARNING_RATE, total_steps=total_steps, pct_start=0.2)
 
         best_val_acc = 0.0
-        fold_save_path = CKPT_DIR / f"best_opt_model_fold{fold}.pth"
+        fold_save_path = CKPT_DIR / f"best_transfer_model_fold{fold}.pth"
 
         for epoch in range(1, EPOCHS + 1):
             model.train()
@@ -336,12 +423,12 @@ def run_training():
         print(f"✅ Fold {fold} Complete. Best Accuracy: {best_val_acc*100:.2f}%")
 
     print("\n" + "=" * 60)
-    print(" 📊 80/20 CROSS-VALIDATION SUMMARY")
+    print(" 📊 PRETRAINED TRANSFER LEARNING SUMMARY")
     print("=" * 60)
     for f_idx, acc in enumerate(fold_accuracies, 1):
         print(f"  Fold {f_idx}: {acc*100:.2f}%")
-    print(f"\n  ⭐ Mean Out-of-Sample Accuracy: {np.mean(fold_accuracies)*100:.2f}% ± {np.std(fold_accuracies)*100:.2f}%")
+    print(f"\n  ⭐ Mean Pretrained Accuracy: {np.mean(fold_accuracies)*100:.2f}% ± {np.std(fold_accuracies)*100:.2f}%")
     print("=" * 60)
 
 if __name__ == "__main__":
-    run_training()
+    run_transfer_learning()
