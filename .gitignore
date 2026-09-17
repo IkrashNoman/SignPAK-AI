@@ -1,3 +1,10 @@
 .venv/
 data/
 models/
+__pycache__/
+.env
+.vscode/
+data_v0_zip.zip
+data_v0_zip.zip
+*.zip
+*.txt
