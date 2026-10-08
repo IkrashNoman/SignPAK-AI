@@ -9,6 +9,7 @@ Input  : data/raw/Signer_*/**/*.mp4 OR data/Signer_*/**/*.mp4
 Output : data/processed/<Signer_X>/<Category>/<label>.mp4
 """
 
+
 import re
 import cv2
 import json
